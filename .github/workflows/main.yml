@@ -1,2 +1,101 @@
-- name: dnsx Action
-  uses: projectdiscovery/dnsx-action@v1.0.0
+name: Subdomain availability (shortest -> longest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "Root domain (e.g. netlib.re)"
+        required: true
+      minLen:
+        description: "Min label length"
+        required: true
+        default: "1"
+      maxLen:
+        description: "Max label length"
+        required: true
+        default: "3"
+      charset:
+        description: "Characters to use"
+        required: true
+        default: "abcdefghijklmnopqrstuvwxyz0123456789"
+      exclude:
+        description: "Chars to exclude (optional)"
+        required: false
+        default: ""
+      resolvers:
+        description: "Custom resolvers file path (optional)"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Generate wordlist by length (shortest first)
+        run: |
+          python - << 'PY'
+          import itertools, os, sys
+          dom     = "${{ inputs.domain }}"
+          min_len = int("${{ inputs.minLen }}")
+          max_len = int("${{ inputs.maxLen }}")
+          charset = "${{ inputs.charset }}"
+          exclude = set("${{ inputs.exclude }}")
+          chars   = ''.join(c for c in charset if c not in exclude)
+
+          # 先按長度、再字典序，輸出 label 與 FQDN 清單
+          with open("labels.txt", "w") as L, open("hosts.txt", "w") as H:
+            for LEN in range(min_len, max_len + 1):
+              for tup in itertools.product(chars, repeat=LEN):
+                lab = ''.join(tup)
+                L.write(lab + "\n")
+                H.write(f"{lab}.{dom}\n")
+          PY
+
+      - name: (Optional) provide custom resolvers
+        if: ${{ inputs.resolvers != '' }}
+        run: |
+          echo "Using custom resolvers file: ${{ inputs.resolvers }}"
+
+      - name: Run dnsx via official Action
+        uses: projectdiscovery/dnsx-action@main
+        with:
+          list: hosts.txt
+          output: used.log
+          # Wildcard 過濾能力來自 dnsx 本身，必要時可在 flags 加上 -wt 參數
+          flags: "-silent -a -aaaa -cname -resp"
+          resolver: ${{ inputs.resolvers }}
+
+      - name: Compute AVAILABLE (candidates minus resolved)
+        shell: bash
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+          # 取出成功解析到的 FQDN -> 只留 FQDN 欄位
+          awk '{print $1}' used.log | sed "s/\\.${DOMAIN}$//" | sort -u > used_labels.txt || true
+          # 差集 = 可用
+          comm -23 <(sort labels.txt) used_labels.txt > available_labels.txt
+          # 依「長度 -> 字典序」排序並補回後綴
+          awk '{print length, $0}' available_labels.txt | sort -n | cut -d' ' -f2- \
+            | sed "s/$/.${DOMAIN}/" > available.txt
+          # 產出 TOP 50 概覽到 Summary
+          echo "### Top 50 available (shortest -> longest)" >> $GITHUB_STEP_SUMMARY
+          head -n 50 available.txt >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total available:** $(wc -l < available.txt)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.domain }}-available"
+          path: |
+            available.txt
+            available_labels.txt
+            used.log
+            used_labels.txt
+            hosts.txt
