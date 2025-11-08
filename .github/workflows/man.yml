@@ -1,0 +1,198 @@
+name: RDAP availability (shortest -> longest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tld:
+        description: "TLD (不含點，例如 re, com)"
+        required: true
+        default: "re"
+      minLen:
+        description: "最短長度（1–3）"
+        required: true
+        default: "1"
+      maxLen:
+        description: "最長長度（1–3）"
+        required: true
+        default: "3"
+      limit:
+        description: "最多輸出多少個可註冊結果（加速用）"
+        required: true
+        default: "200"
+      prefix:
+        description: "（選填）只找這個前綴開頭的 label"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install deps
+        run: pip install aiohttp
+
+      - name: RDAP scan (generate -> RDAP -> available)
+        env:
+          TLD: ${{ inputs.tld }}
+          MINLEN: ${{ inputs.minLen }}
+          MAXLEN: ${{ inputs.maxLen }}
+          LIMIT: ${{ inputs.limit }}
+          PREFIX: ${{ inputs.prefix }}
+        run: |
+          python - << 'PY'
+          import asyncio, aiohttp, itertools, string, sys, json, math
+          from urllib.request import urlopen
+          from urllib.error import URLError
+
+          tld     = (sys.argv[1] if len(sys.argv)>1 else "").lower() or "${{ env.TLD }}".lower().strip(".")
+          min_len = max(1, int("${{ env.MINLEN }}"))
+          max_len = min(3, int("${{ env.MAXLEN }}"))
+          limit   = max(1, int("${{ env.LIMIT }}"))
+          prefix  = "${{ env.PREFIX }}".lower()
+
+          # ---- 規則（依你要求）----
+          # 1) 必須以字母開頭
+          # 2) 中間可為字母/數字/連字號-
+          # 3) 必須以字母或數字結束
+          letters  = "abcdefghijklmnopqrstuvwxyz"
+          digits   = "0123456789"
+          midchars = letters + digits + "-"
+          endchars = letters + digits
+
+          # AFNIC (.re, .pm, .wf, .yt, .tf) 目前 **不開放 1 或 2 字符** 的註冊（官方命名憲章 2025/05/05）
+          AFNIC_BLOCK_1_2 = {"re","pm","wf","yt","tf"}
+          if tld in AFNIC_BLOCK_1_2:
+            min_len = max(min_len, 3)
+
+          def gen_labels(minlen, maxlen, prefix=""):
+            pref = prefix
+            # 如果前綴存在，需先驗證其符合規則前半段
+            if pref:
+              if not pref[0:1].islower() or pref[0] not in letters:  # 必須以字母開頭
+                return
+              if len(pref) >= 1 and pref[-1] == '-':  # 目前結尾暫可為 '-', 但生成時會補尾字元
+                pass
+              for ch in pref[1:-1]:
+                if ch not in midchars:
+                  return
+            for L in range(minlen, maxlen+1):
+              if len(pref) > L:  # 前綴太長，跳過
+                continue
+              firsts = [pref[0]] if pref else letters
+              for f in firsts:
+                if f not in letters: 
+                  continue
+                if L == 1:
+                  if not pref or pref==f:
+                    yield f
+                  continue
+                # 中段長度
+                mid_len = max(0, L-2)
+                # 已占用長度
+                used = len(pref)
+                # 我們要補齊第2到第L-1位
+                def mid_iter():
+                  base = pref[1:-1] if len(pref) >=2 else ""
+                  if mid_len == len(base):
+                    yield base
+                  else:
+                    # 以字典序產生，確保最短優先 + 內部從小到大
+                    fixed_prefix = base
+                    remaining = mid_len - len(base)
+                    for tup in itertools.product(midchars, repeat=remaining):
+                      yield fixed_prefix + ''.join(tup)
+                for mid in mid_iter():
+                  for last in ([pref[-1]] if (len(pref)==L and pref[-1] in endchars) else endchars):
+                    label = f + mid + last
+                    # 規則：不能以 '-' 結束（已保證 last ∈ endchars），也不能以非字母開頭（已保證）
+                    # 進一步：避免出現非法的 punycode 偽前綴 "xn--" 除非是 IDN，但我們只生成 ASCII，忽略即可
+                    if label.startswith("xn--"):
+                      continue
+                    # 若前綴有提供且長度< L，還需檢查 label 是否以 prefix 開頭
+                    if prefix and not label.startswith(prefix):
+                      continue
+                    yield label
+
+          # RDAP 伺服器自動發現（IANA bootstrap）
+          rdap_base = None
+          try:
+            data = json.load(urlopen("https://data.iana.org/rdap/dns.json", timeout=10))
+            for svc in data.get("services", []):
+              tlds, urls = svc
+              if tld in [x.lower() for x in tlds]:
+                rdap_base = urls[0].rstrip("/")
+                break
+          except URLError:
+            pass
+          if not rdap_base:
+            # 常見備援（會依 IANA 記錄轉送）
+            rdap_base = "https://rdap.org"
+
+          # 併發與節流
+          CONCURRENCY = 50
+          RETRIES     = 2
+
+          q = asyncio.Queue()
+          for lab in gen_labels(min_len, max_len, prefix):
+            q.put_nowait(lab)
+
+          available = []
+          checked   = 0
+
+          async def worker(session):
+            nonlocal available, checked
+            while not q.empty() and len(available) < limit:
+              lab = await q.get()
+              domain = f"{lab}.{tld}"
+              url = f"{rdap_base}/domain/{domain}"
+              ok = False
+              for attempt in range(RETRIES+1):
+                try:
+                  async with session.get(url, timeout=10) as resp:
+                    status = resp.status
+                    # RDAP：未註冊→通常回 404；有資料（已註冊/保留/遮罩）→200/4xx/5xx 非 404 視為不可註冊
+                    if status == 404:
+                      available.append(domain)
+                    # 其他狀態都當作「非可註冊」
+                    ok = True
+                except Exception:
+                  pass
+                if ok or attempt==RETRIES:
+                  break
+              checked += 1
+
+          async def main():
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=10)
+            conn = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY)
+            async with aiohttp.ClientSession(timeout=timeout, connector=conn, headers={"User-Agent":"rdap-availability-gha/1.0"}) as session:
+              tasks = [asyncio.create_task(worker(session)) for _ in range(CONCURRENCY)]
+              await asyncio.gather(*tasks)
+
+          asyncio.run(main())
+
+          # 寫檔 & Summary
+          open("available.txt","w").write("\n".join(available) + ("\n" if available else ""))
+          open("checked.txt","w").write(str(checked))
+          open("rdap_base.txt","w").write(rdap_base+"\n")
+
+          # GitHub Summary
+          print("### RDAP base:", rdap_base)
+          print(f"Checked: {checked} candidates")
+          print(f"Found available: {len(available)}")
+          print("Top 50 available (shortest -> longest):")
+          for d in available[:50]:
+            print(d)
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "available-${{ inputs.tld }}"
+          path: |
+            available.txt
+            checked.txt
+            rdap_base.txt
